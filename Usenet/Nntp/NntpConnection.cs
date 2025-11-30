@@ -24,6 +24,7 @@ namespace Usenet.Nntp
         private readonly TcpClient client = new TcpClient();
         private StreamWriter writer;
         private NntpStreamReader reader;
+        private string _targetHost;
 
         /// <inheritdoc/>
         public CountingStream Stream { get; private set; }
@@ -33,9 +34,14 @@ namespace Usenet.Nntp
         {
             log.LogInformation("Connecting: {hostname} {port} (Use SSl = {useSsl})", hostname, port, useSsl);
             await client.ConnectAsync(hostname, port);
+
+            _targetHost = hostname;
+
             Stream = await GetStreamAsync(hostname, useSsl);
+
             writer = new StreamWriter(Stream, UsenetEncoding.Default) { AutoFlush = true };
             reader = new NntpStreamReader(Stream, UsenetEncoding.Default);
+
             return GetResponse(parser);
         }
 
@@ -43,13 +49,14 @@ namespace Usenet.Nntp
         public TResponse Command<TResponse>(string command, IResponseParser<TResponse> parser)
         {
             ThrowIfNotConnected();
-            log.LogInformation("Sending command: {Command}",command.StartsWith("AUTHINFO PASS", StringComparison.Ordinal) ? "AUTHINFO PASS [omitted]" : command);
+            log.LogInformation("Sending command: {Command}",
+                command.StartsWith("AUTHINFO PASS", StringComparison.Ordinal) ? "AUTHINFO PASS [omitted]" : command);
             writer.WriteLine(command);
             return GetResponse(parser);
         }
 
         /// <inheritdoc/>
-        public TResponse MultiLineCommand<TResponse>(string command, IMultiLineResponseParser<TResponse> parser) //, bool decompress = false)
+        public TResponse MultiLineCommand<TResponse>(string command, IMultiLineResponseParser<TResponse> parser)
         {
             NntpResponse response = Command(command, new ResponseParser());
 
@@ -67,13 +74,11 @@ namespace Usenet.Nntp
             log.LogInformation("Response received: {Response}", responseText);
 
             if (responseText == null)
-            {
                 throw new NntpException("Received no response.");
-            }
+
             if (responseText.Length < 3 || !int.TryParse(responseText.Substring(0, 3), out int code))
-            {
                 throw new NntpException("Received invalid response.");
-            }
+
             return parser.Parse(code, responseText.Substring(3).Trim());
         }
 
@@ -87,20 +92,26 @@ namespace Usenet.Nntp
         private void ThrowIfNotConnected()
         {
             if (!client.Connected)
-            {
                 throw new NntpException("Client not connected.");
-            }
         }
 
         private async Task<CountingStream> GetStreamAsync(string hostname, bool useSsl)
         {
-            NetworkStream stream = client.GetStream();
+            NetworkStream networkStream = client.GetStream();
+
             if (!useSsl)
-            {
-                return new CountingStream(stream);
-            }
-            var sslStream = new SslStream(stream);
+                return new CountingStream(networkStream);
+
+            // SSL with custom certificate validation
+            var sslStream = new SslStream(
+                networkStream,
+                false,
+                (sender, cert, chain, errors) =>
+                    CustomCertValidator.Validate(sender, cert, chain, errors, _targetHost)
+            );
+
             await sslStream.AuthenticateAsClientAsync(hostname);
+
             return new CountingStream(sslStream);
         }
 
@@ -108,9 +119,7 @@ namespace Usenet.Nntp
         {
             string line;
             while ((line = reader.ReadLine()) != null)
-            {
                 yield return line;
-            }
         }
 
         /// <inheritdoc/>
